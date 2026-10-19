@@ -1,0 +1,5 @@
+/target/
+minesweeper_settings.json
+*.pdb
+.DS_Store
+Thumbs.db
