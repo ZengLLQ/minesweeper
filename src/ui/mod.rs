@@ -663,9 +663,8 @@ pub fn draw_settings_panel(
                     }
                 },
                 _ => {
-                    draft.error_msg = Some(
-                        "Enter positive integers for width, height, and mines".to_owned(),
-                    );
+                    draft.error_msg =
+                        Some("Enter positive integers for width, height, and mines".to_owned());
                 }
             }
         }

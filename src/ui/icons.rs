@@ -323,11 +323,17 @@ pub fn draw_speaker_icon(
         let cx = center.x + size * 0.24;
         let d = size * 0.13;
         painter.line_segment(
-            [Pos2::new(cx - d, center.y - d), Pos2::new(cx + d, center.y + d)],
+            [
+                Pos2::new(cx - d, center.y - d),
+                Pos2::new(cx + d, center.y + d),
+            ],
             stroke,
         );
         painter.line_segment(
-            [Pos2::new(cx + d, center.y - d), Pos2::new(cx - d, center.y + d)],
+            [
+                Pos2::new(cx + d, center.y - d),
+                Pos2::new(cx - d, center.y + d),
+            ],
             stroke,
         );
     }

@@ -82,10 +82,7 @@ impl SoundBank {
 }
 
 enum AudioCommand {
-    Play {
-        effect: SoundEffect,
-        volume: f32,
-    },
+    Play { effect: SoundEffect, volume: f32 },
 }
 
 /// Non-blocking procedural audio manager backed by a dedicated background playback thread.
@@ -553,7 +550,9 @@ fn synth_lose() -> Vec<f32> {
         let tone = (low_tone_phase.sin() + 0.25 * (low_tone_phase * 1.5).sin()) * tone_env * 0.20;
 
         // Low-pass filtered noise thud
-        rng_state = rng_state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        rng_state = rng_state
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
         let white = ((rng_state >> 9) as f32 / 4_194_304.0) - 1.0;
         let cutoff_alpha = (0.14 * (-t * 7.0).exp()).clamp(0.015, 0.18);
         lp_noise += cutoff_alpha * (white - lp_noise);
