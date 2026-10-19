@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use minesweeper::anim::AnimationManager;
-use minesweeper::audio::{sanitize_volume, SoundEffect, SoundManager};
+use minesweeper::audio::{sanitize_volume, select_reveal_sound, SoundEffect, SoundManager};
 use minesweeper::game::{Board, Difficulty, FlagOutcome, GameState, RevealOutcome};
 use minesweeper::storage::{PersistentData, ThemeMode};
 use minesweeper::ui::{self, CustomDraft, UiAction};
@@ -140,15 +140,8 @@ impl MinesweeperApp {
                 self.sound.play(SoundEffect::Lose);
             }
             _ => {
-                let revealed_len = outcome.revealed.len();
-                if revealed_len > 2 {
-                    self.sound.play(SoundEffect::RevealCascade(revealed_len));
-                } else if revealed_len > 0 {
-                    if is_chord {
-                        self.sound.play(SoundEffect::Chord);
-                    } else {
-                        self.sound.play(SoundEffect::RevealSingle);
-                    }
+                if let Some(effect) = select_reveal_sound(&outcome.revealed, is_chord) {
+                    self.sound.play(effect);
                 }
             }
         }
@@ -216,7 +209,12 @@ impl MinesweeperApp {
                 let _ = self.data.save();
             }
             UiAction::SelectDifficulty(diff) => {
+                let was_custom = matches!(self.board.difficulty(), Difficulty::Custom { .. });
                 self.change_difficulty(diff);
+                if matches!(diff, Difficulty::Custom { .. }) && !was_custom && !self.settings_open {
+                    self.settings_open = true;
+                    self.anim.set_settings_open(true, self.data.reduce_motion);
+                }
                 self.sound.play(SoundEffect::UiClick);
             }
             UiAction::SetTheme(mode) => {
@@ -243,6 +241,10 @@ impl MinesweeperApp {
                 let v = sanitize_volume(vol);
                 self.data.sound_volume = v;
                 self.sound.set_volume(v);
+                if v > 0.001 && !self.data.sound_enabled {
+                    self.data.sound_enabled = true;
+                    self.sound.set_enabled(true);
+                }
                 let _ = self.data.save();
             }
         }

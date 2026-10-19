@@ -429,12 +429,7 @@ pub fn draw_difficulty_bar(
         );
 
         if resp.clicked() {
-            if matches!(diff, Difficulty::Custom { .. }) && !is_active {
-                actions.push(UiAction::SelectDifficulty(diff));
-                actions.push(UiAction::ToggleSettings);
-            } else {
-                actions.push(UiAction::SelectDifficulty(diff));
-            }
+            actions.push(UiAction::SelectDifficulty(diff));
         }
         x_cursor += pill_w + 6.0;
     }
@@ -515,16 +510,22 @@ pub fn draw_settings_panel(
     );
     child_ui.set_opacity(t);
 
-    let compact = inner.width() < 470.0;
-    let show_vol_slider = inner.width() >= 530.0;
+    let compact = inner.width() < 540.0;
+    let ultra_compact = inner.width() < 430.0;
 
     child_ui.horizontal(|ui| {
         ui.label(
-            egui::RichText::new(if compact { "Theme:" } else { "Preferences:" })
-                .font(FontId::new(12.5, FontFamily::Name("InterBold".into())))
-                .color(palette.text_primary),
+            egui::RichText::new(if ultra_compact {
+                "Theme:"
+            } else if compact {
+                "Prefs:"
+            } else {
+                "Preferences:"
+            })
+            .font(FontId::new(12.5, FontFamily::Name("InterBold".into())))
+            .color(palette.text_primary),
         );
-        ui.add_space(if compact { 3.0 } else { 8.0 });
+        ui.add_space(if compact { 2.0 } else { 8.0 });
 
         let is_dark = theme_mode == ThemeMode::Dark;
         if ui.selectable_label(is_dark, "Dark").clicked() && !is_dark {
@@ -534,7 +535,7 @@ pub fn draw_settings_panel(
             actions.push(UiAction::SetTheme(ThemeMode::Light));
         }
 
-        ui.add_space(if compact { 4.0 } else { 10.0 });
+        ui.add_space(if compact { 3.0 } else { 10.0 });
         let mut rm = reduce_motion;
         let rm_label = if compact { "Motion" } else { "Reduce motion" };
         if ui
@@ -545,27 +546,31 @@ pub fn draw_settings_panel(
             actions.push(UiAction::SetReduceMotion(rm));
         }
 
-        ui.add_space(if compact { 4.0 } else { 10.0 });
+        ui.add_space(if compact { 3.0 } else { 10.0 });
         let mut sfx = sound_enabled;
         let sfx_label = if compact { "SFX" } else { "Sound (M)" };
         if ui.checkbox(&mut sfx, sfx_label).changed() {
             actions.push(UiAction::SetSoundEnabled(sfx));
         }
 
-        if show_vol_slider && sound_enabled {
-            let mut vol_pct = (sound_volume.clamp(0.0, 1.0) * 100.0).round() as i32;
-            ui.spacing_mut().slider_width = 68.0;
-            if ui
-                .add(
-                    egui::Slider::new(&mut vol_pct, 0..=100)
-                        .suffix("%")
-                        .show_value(true),
-                )
-                .on_hover_text("Sound effects volume")
-                .changed()
-            {
-                actions.push(UiAction::SetSoundVolume(vol_pct as f32 / 100.0));
-            }
+        let mut vol_pct = (sound_volume.clamp(0.0, 1.0) * 100.0).round() as i32;
+        ui.spacing_mut().slider_width = if ultra_compact {
+            42.0
+        } else if compact {
+            56.0
+        } else {
+            68.0
+        };
+        if ui
+            .add(
+                egui::Slider::new(&mut vol_pct, 0..=100)
+                    .suffix("%")
+                    .show_value(!ultra_compact),
+            )
+            .on_hover_text(format!("Sound effects volume ({vol_pct}%)"))
+            .changed()
+        {
+            actions.push(UiAction::SetSoundVolume(vol_pct as f32 / 100.0));
         }
     });
 

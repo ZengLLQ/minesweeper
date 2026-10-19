@@ -1,8 +1,9 @@
 use rodio::buffer::SamplesBuffer;
-use rodio::{OutputStream, Source};
+use rodio::{OutputStream, OutputStreamHandle, Source};
 use std::f32::consts::{PI, TAU};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Standard mono sample rate (44.1 kHz) used for all procedurally generated sound effects.
 pub const SAMPLE_RATE: u32 = 44_100;
@@ -10,7 +11,7 @@ pub const SAMPLE_RATE: u32 = 44_100;
 /// Procedural sound effect types triggered by game and UI events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SoundEffect {
-    /// Crisp, warm tactile pop when revealing a single cell (or 1–2 cells).
+    /// Crisp, warm tactile pop when revealing a single cell.
     RevealSingle,
     /// Ascending pentatonic shimmer cascade when flood-fill reveals multiple cells.
     RevealCascade(usize),
@@ -88,7 +89,8 @@ enum AudioCommand {
 }
 
 /// Non-blocking procedural audio manager backed by a dedicated background playback thread.
-/// Gracefully degrades to a silent no-op if the host machine has no audio output device.
+/// Gracefully degrades to a silent no-op if the host machine has no audio output device,
+/// and automatically reconnects if an audio device becomes available later.
 pub struct SoundManager {
     enabled: bool,
     volume: f32,
@@ -104,19 +106,59 @@ impl SoundManager {
             .name("minesweeper-audio".to_owned())
             .spawn(move || {
                 let bank = SoundBank::new();
-                // Keep OutputStream alive for the lifetime of the worker thread.
-                let stream_pair = OutputStream::try_default().ok();
+                let mut stream_pair: Option<(OutputStream, OutputStreamHandle)> = None;
+                let mut last_init_attempt: Option<Instant> = None;
+                let mut last_played: Option<(SoundEffect, Instant)> = None;
 
                 while let Ok(cmd) = rx.recv() {
                     let AudioCommand::Play { effect, volume } = cmd;
                     if volume <= 0.001 {
                         continue;
                     }
+
+                    let now = Instant::now();
+                    // Deduplicate identical sound effects triggered within < 12ms to prevent clipping
+                    if let Some((prev_effect, prev_inst)) = last_played {
+                        if std::mem::discriminant(&prev_effect) == std::mem::discriminant(&effect)
+                            && now.duration_since(prev_inst) < Duration::from_millis(12)
+                        {
+                            continue;
+                        }
+                    }
+                    last_played = Some((effect, now));
+
+                    // Lazily open or retry opening the default OS audio stream (with a 2s retry cooldown)
+                    let can_try_init = last_init_attempt
+                        .map(|t| now.duration_since(t) >= Duration::from_secs(2))
+                        .unwrap_or(true);
+                    if stream_pair.is_none() && can_try_init {
+                        last_init_attempt = Some(now);
+                        stream_pair = OutputStream::try_default().ok();
+                    }
+
+                    let amp = volume.clamp(0.0, 1.0);
+                    let mut stream_failed = false;
                     if let Some((_, ref handle)) = stream_pair {
                         let samples = bank.samples_for(effect).to_vec();
-                        let source =
-                            SamplesBuffer::new(1, SAMPLE_RATE, samples).amplify(volume.clamp(0.0, 1.0));
-                        let _ = handle.play_raw(source);
+                        let source = SamplesBuffer::new(1, SAMPLE_RATE, samples).amplify(amp);
+                        if handle.play_raw(source).is_err() {
+                            stream_failed = true;
+                        }
+                    }
+
+                    // If the active stream was invalidated (e.g. device hot-swap), try re-opening once
+                    if stream_failed {
+                        stream_pair = None;
+                        if can_try_init {
+                            last_init_attempt = Some(now);
+                            stream_pair = OutputStream::try_default().ok();
+                            if let Some((_, ref handle)) = stream_pair {
+                                let samples = bank.samples_for(effect).to_vec();
+                                let source =
+                                    SamplesBuffer::new(1, SAMPLE_RATE, samples).amplify(amp);
+                                let _ = handle.play_raw(source);
+                            }
+                        }
                     }
                 }
             });
@@ -185,6 +227,35 @@ pub fn sanitize_volume(volume: f32) -> f32 {
     }
 }
 
+/// Selects the appropriate sound effect for a non-terminal reveal or chord operation.
+///
+/// - For a direct cell click (`is_chord == false`), revealing a single cell plays `RevealSingle`,
+///   while flood-filling multiple cells plays `RevealCascade(len)`.
+/// - For a chord action (`is_chord == true`), revealing only direct neighbors (`dist <= 1`)
+///   always plays `Chord` (even when 3–7 neighbors open simultaneously), while a chord that
+///   triggers a multi-step flood-fill wave (`dist > 1`) plays `RevealCascade(len)`.
+pub fn select_reveal_sound(
+    revealed: &[(usize, usize, usize)],
+    is_chord: bool,
+) -> Option<SoundEffect> {
+    let len = revealed.len();
+    if len == 0 {
+        return None;
+    }
+    if is_chord {
+        let has_flood_cascade = revealed.iter().any(|&(_, _, dist)| dist > 1);
+        if has_flood_cascade {
+            Some(SoundEffect::RevealCascade(len))
+        } else {
+            Some(SoundEffect::Chord)
+        }
+    } else if len > 1 {
+        Some(SoundEffect::RevealCascade(len))
+    } else {
+        Some(SoundEffect::RevealSingle)
+    }
+}
+
 /// Synthesizes a mono `44.1 kHz` PCM buffer (`-1.0..=1.0`) for the given `SoundEffect`.
 pub fn synthesize_effect(effect: SoundEffect) -> Vec<f32> {
     let mut buf = match effect {
@@ -207,17 +278,21 @@ fn apply_edge_declick(samples: &mut [f32]) {
     if len == 0 {
         return;
     }
-    let fade_in = 88.min(len / 2); // ~2ms
-    let fade_out = 176.min(len / 2); // ~4ms
+    if len == 1 {
+        samples[0] = 0.0;
+        return;
+    }
+    let fade_in = 88.min(len / 2).max(1); // ~2ms
+    let fade_out = 176.min(len / 2).max(1); // ~4ms
 
     for (i, sample) in samples.iter_mut().take(fade_in).enumerate() {
-        let t = i as f32 / fade_in.max(1) as f32;
+        let t = i as f32 / fade_in as f32;
         let gain = 0.5 * (1.0 - (PI * t).cos());
         *sample = (*sample * gain).clamp(-0.95, 0.95);
     }
     for i in 0..fade_out {
         let idx = len - 1 - i;
-        let t = i as f32 / fade_out.max(1) as f32;
+        let t = i as f32 / fade_out as f32;
         let gain = 0.5 * (1.0 - (PI * t).cos());
         samples[idx] = (samples[idx] * gain).clamp(-0.95, 0.95);
     }
@@ -228,6 +303,26 @@ fn apply_edge_declick(samples: &mut [f32]) {
             *sample = sample.clamp(-0.95, 0.95);
         }
     }
+}
+
+/// Smooth raised-cosine attack and tail release window (`0.0..=1.0`) for a note of length `note_len`.
+#[inline]
+fn smooth_note_window(t: f32, note_len: f32, attack_sec: f32, release_sec: f32) -> f32 {
+    if t <= 0.0 || t >= note_len {
+        return 0.0;
+    }
+    let attack = if t < attack_sec {
+        0.5 * (1.0 - (PI * (t / attack_sec.max(1e-5))).cos())
+    } else {
+        1.0
+    };
+    let rem = note_len - t;
+    let release = if rem < release_sec {
+        0.5 * (1.0 - (PI * (rem / release_sec.max(1e-5))).cos())
+    } else {
+        1.0
+    };
+    attack * release
 }
 
 /// Crisp, warm wooden/marimba-like pop for revealing a single cell (~65ms).
@@ -243,7 +338,8 @@ fn synth_reveal_single() -> Vec<f32> {
         let freq = 480.0 + 140.0 * (1.0 - (-t * 55.0).exp());
         phase += TAU * freq / SAMPLE_RATE as f32;
 
-        let env = (-t * 46.0).exp() * (1.0 - (-t * 450.0).exp());
+        let win = smooth_note_window(t, duration, 0.003, 0.012);
+        let env = win * (-t * 44.0).exp();
         let fundamental = phase.sin();
         let overtone = (phase * 2.0).sin() * 0.22 * (-t * 75.0).exp();
         *sample = (fundamental + overtone) * env * 0.36;
@@ -281,10 +377,10 @@ fn synth_reveal_cascade(count: usize) -> Vec<f32> {
             let t = i as f32 / SAMPLE_RATE as f32;
             phase += TAU * freq / SAMPLE_RATE as f32;
 
-            let attack = (t / 0.005).min(1.0);
-            let decay = (-t * 28.0).exp();
+            let win = smooth_note_window(t, note_len, 0.005, 0.018);
+            let decay = (-t * 26.0).exp();
             let bell = phase.sin() + 0.18 * (phase * 2.0).sin() * (-t * 45.0).exp();
-            out[idx] += bell * attack * decay * 0.22;
+            out[idx] += bell * win * decay * 0.22;
         }
     }
     out
@@ -303,16 +399,16 @@ fn synth_chord() -> Vec<f32> {
         let f1 = 523.25; // C5
         let f2 = 783.99; // G5
         p1 += TAU * f1 / SAMPLE_RATE as f32;
-        p2 += TAU * f2 / SAMPLE_RATE as f32;
 
-        let attack1 = (t / 0.004).min(1.0);
-        let env1 = attack1 * (-t * 34.0).exp();
+        let win1 = smooth_note_window(t, duration, 0.004, 0.015);
+        let env1 = win1 * (-t * 34.0).exp();
 
         // Second note enters 14ms later for a subtle double-tap chord feel
-        let t2 = (t - 0.014).max(0.0);
-        let attack2 = (t2 / 0.004).min(1.0);
         let env2 = if t >= 0.014 {
-            attack2 * (-t2 * 38.0).exp()
+            let t2 = t - 0.014;
+            p2 += TAU * f2 / SAMPLE_RATE as f32;
+            let win2 = smooth_note_window(t2, duration - 0.014, 0.004, 0.015);
+            win2 * (-t2 * 38.0).exp()
         } else {
             0.0
         };
@@ -324,46 +420,68 @@ fn synth_chord() -> Vec<f32> {
     out
 }
 
-/// Upward two-tone tactile click when placing a flag (~75ms).
+/// Upward two-tone tactile click when placing a flag (~75ms) with overlapping envelopes.
 fn synth_flag_place() -> Vec<f32> {
     let duration = 0.075;
     let total = (SAMPLE_RATE as f32 * duration) as usize;
     let mut out = vec![0.0; total];
-    let mut phase = 0.0_f32;
+    let mut p1 = 0.0_f32;
+    let mut p2 = 0.0_f32;
 
     for (i, sample) in out.iter_mut().enumerate() {
         let t = i as f32 / SAMPLE_RATE as f32;
-        // Steps from A4 (440 Hz) to E5 (659.25 Hz) at 28ms
-        let freq = if t < 0.028 { 440.0 } else { 659.25 };
-        phase += TAU * freq / SAMPLE_RATE as f32;
+        // First tone: A4 (440 Hz)
+        p1 += TAU * 440.0 / SAMPLE_RATE as f32;
+        let win1 = smooth_note_window(t, duration, 0.003, 0.014);
+        let env1 = win1 * (-t * 52.0).exp();
+        let wave1 = p1.sin() + 0.18 * (p1 * 3.0).sin() * (-t * 80.0).exp();
 
-        let local_t = if t < 0.028 { t } else { t - 0.028 };
-        let attack = (local_t / 0.003).min(1.0);
-        let decay = (-local_t * 42.0).exp();
-        let wave = phase.sin() + 0.20 * (phase * 3.0).sin() * (-local_t * 80.0).exp();
-        *sample = wave * attack * decay * 0.30;
+        // Second tone: E5 (659.25 Hz) enters smoothly at 26ms
+        let part2 = if t >= 0.026 {
+            let t2 = t - 0.026;
+            p2 += TAU * 659.25 / SAMPLE_RATE as f32;
+            let win2 = smooth_note_window(t2, duration - 0.026, 0.0035, 0.014);
+            let env2 = win2 * (-t2 * 44.0).exp();
+            let wave2 = p2.sin() + 0.18 * (p2 * 3.0).sin() * (-t2 * 80.0).exp();
+            wave2 * env2 * 0.28
+        } else {
+            0.0
+        };
+
+        *sample = wave1 * env1 * 0.26 + part2;
     }
     out
 }
 
-/// Soft downward two-tone tick when removing a flag (~70ms).
+/// Soft downward two-tone tick when removing a flag (~70ms) with overlapping envelopes.
 fn synth_flag_remove() -> Vec<f32> {
     let duration = 0.070;
     let total = (SAMPLE_RATE as f32 * duration) as usize;
     let mut out = vec![0.0; total];
-    let mut phase = 0.0_f32;
+    let mut p1 = 0.0_f32;
+    let mut p2 = 0.0_f32;
 
     for (i, sample) in out.iter_mut().enumerate() {
         let t = i as f32 / SAMPLE_RATE as f32;
-        // Steps down from D5 (587.33 Hz) to A4 (440 Hz) at 26ms
-        let freq = if t < 0.026 { 587.33 } else { 440.0 };
-        phase += TAU * freq / SAMPLE_RATE as f32;
+        // First tone: D5 (587.33 Hz)
+        p1 += TAU * 587.33 / SAMPLE_RATE as f32;
+        let win1 = smooth_note_window(t, duration, 0.003, 0.014);
+        let env1 = win1 * (-t * 54.0).exp();
+        let wave1 = p1.sin() + 0.14 * (p1 * 2.0).sin();
 
-        let local_t = if t < 0.026 { t } else { t - 0.026 };
-        let attack = (local_t / 0.003).min(1.0);
-        let decay = (-local_t * 45.0).exp();
-        let wave = phase.sin() + 0.14 * (phase * 2.0).sin();
-        *sample = wave * attack * decay * 0.25;
+        // Second tone: A4 (440.0 Hz) enters smoothly at 24ms
+        let part2 = if t >= 0.024 {
+            let t2 = t - 0.024;
+            p2 += TAU * 440.0 / SAMPLE_RATE as f32;
+            let win2 = smooth_note_window(t2, duration - 0.024, 0.0035, 0.014);
+            let env2 = win2 * (-t2 * 46.0).exp();
+            let wave2 = p2.sin() + 0.14 * (p2 * 2.0).sin();
+            wave2 * env2 * 0.24
+        } else {
+            0.0
+        };
+
+        *sample = wave1 * env1 * 0.24 + part2;
     }
     out
 }
@@ -372,11 +490,11 @@ fn synth_flag_remove() -> Vec<f32> {
 fn synth_win() -> Vec<f32> {
     // C5, E5, G5, B5, D6
     const CHIME_NOTES: [(f32, f32, f32); 5] = [
-        (523.25, 0.00, 0.28),
-        (659.25, 0.065, 0.28),
-        (783.99, 0.130, 0.30),
-        (987.77, 0.195, 0.32),
-        (1174.66, 0.265, 0.35),
+        (523.25, 0.00, 0.32),
+        (659.25, 0.065, 0.32),
+        (783.99, 0.130, 0.34),
+        (987.77, 0.195, 0.36),
+        (1174.66, 0.265, 0.355),
     ];
     let duration = 0.62;
     let total = (SAMPLE_RATE as f32 * duration) as usize;
@@ -395,12 +513,12 @@ fn synth_win() -> Vec<f32> {
             let t = i as f32 / SAMPLE_RATE as f32;
             phase += TAU * freq / SAMPLE_RATE as f32;
 
-            let attack = (t / 0.006).min(1.0);
+            let win = smooth_note_window(t, hold_sec, 0.006, 0.035);
             let decay = (-t * 7.5).exp();
             let shimmer = phase.sin()
                 + 0.22 * (phase * 2.0).sin() * (-t * 14.0).exp()
                 + 0.08 * (phase * 3.0).sin() * (-t * 22.0).exp();
-            out[idx] += shimmer * attack * decay * 0.20;
+            out[idx] += shimmer * win * decay * 0.20;
         }
     }
     out
@@ -420,6 +538,7 @@ fn synth_lose() -> Vec<f32> {
 
     for (i, sample) in out.iter_mut().enumerate() {
         let t = i as f32 / SAMPLE_RATE as f32;
+        let win = smooth_note_window(t, duration, 0.003, 0.025);
 
         // Pitch-dropping sub-bass impact (155 Hz -> 44 Hz)
         let sub_freq = 44.0 + 111.0 * (-t * 18.0).exp();
@@ -441,7 +560,7 @@ fn synth_lose() -> Vec<f32> {
         let noise_env = (-t * 11.5).exp();
         let rumble = lp_noise * noise_env * 0.42;
 
-        *sample = sub + tone + rumble;
+        *sample = (sub + tone + rumble) * win;
     }
     out
 }
@@ -457,7 +576,8 @@ fn synth_ui_click() -> Vec<f32> {
         let t = i as f32 / SAMPLE_RATE as f32;
         let freq = 720.0 * (-t * 25.0).exp().max(0.5);
         phase += TAU * freq / SAMPLE_RATE as f32;
-        let env = (t / 0.002).min(1.0) * (-t * 95.0).exp();
+        let win = smooth_note_window(t, duration, 0.002, 0.006);
+        let env = win * (-t * 95.0).exp();
         *sample = phase.sin() * env * 0.20;
     }
     out
@@ -514,11 +634,20 @@ mod tests {
                 samples.last().copied().unwrap_or(1.0).abs() < 1e-5,
                 "Last sample of {effect:?} must end at zero"
             );
+
+            // Sample-to-sample continuity check: verify no internal step discontinuities / mid-buffer clicks
+            let max_delta = samples
+                .windows(2)
+                .fold(0.0_f32, |acc, w| acc.max((w[1] - w[0]).abs()));
+            assert!(
+                max_delta < 0.12,
+                "Effect {effect:?} has an abrupt sample-to-sample jump of {max_delta}"
+            );
         }
     }
 
     #[test]
-    fn test_sound_manager_state_and_volume_sanitization() {
+    fn test_sound_manager_state_volume_sanitization_and_burst_spam() {
         assert!((sanitize_volume(0.5) - 0.5).abs() < 1e-6);
         assert!((sanitize_volume(-2.0) - 0.0).abs() < 1e-6);
         assert!((sanitize_volume(5.0) - 1.0).abs() < 1e-6);
@@ -541,15 +670,44 @@ mod tests {
         apply_edge_declick(&mut empty);
         let mut single = [0.8_f32];
         apply_edge_declick(&mut single);
-        assert!(single[0].is_finite());
+        assert!(single[0].abs() < 1e-6);
 
         let zero_cascade = synthesize_effect(SoundEffect::RevealCascade(0));
         let max_cascade = synthesize_effect(SoundEffect::RevealCascade(usize::MAX));
         assert!(!zero_cascade.is_empty());
         assert!(max_cascade.len() > zero_cascade.len());
 
-        // Worker-thread SoundManager lifecycle (with volume 0.0 so tests never emit audible sound)
-        let live_mgr = SoundManager::new(true, 0.0);
-        live_mgr.play(SoundEffect::UiClick);
+        // Stress-test worker-thread SoundManager with rapid 100-message spam without blocking
+        let mut live_mgr = SoundManager::new(true, 0.0005); // sub-threshold volume stays silent in tests
+        for i in 0..100 {
+            live_mgr.play(SoundEffect::RevealCascade(i));
+            live_mgr.play(SoundEffect::UiClick);
+        }
+        live_mgr.set_volume(0.0);
+        live_mgr.play(SoundEffect::Win);
+
+        // Verify reveal vs chord vs cascade sound selection
+        assert_eq!(select_reveal_sound(&[], false), None);
+        assert_eq!(select_reveal_sound(&[], true), None);
+        assert_eq!(
+            select_reveal_sound(&[(2, 2, 0)], false),
+            Some(SoundEffect::RevealSingle)
+        );
+        assert_eq!(
+            select_reveal_sound(&[(2, 2, 0), (2, 3, 1), (3, 3, 1)], false),
+            Some(SoundEffect::RevealCascade(3))
+        );
+        // Chording 4 direct neighbors (all at dist == 1) must play Chord, not RevealCascade
+        let chord_direct = [(1, 0, 1), (2, 0, 1), (0, 1, 1), (2, 1, 1)];
+        assert_eq!(
+            select_reveal_sound(&chord_direct, true),
+            Some(SoundEffect::Chord)
+        );
+        // Chording that triggers a multi-step flood-fill wave (dist > 1) plays RevealCascade
+        let chord_flood = [(1, 0, 1), (2, 0, 1), (3, 0, 2), (4, 0, 3)];
+        assert_eq!(
+            select_reveal_sound(&chord_flood, true),
+            Some(SoundEffect::RevealCascade(4))
+        );
     }
 }
