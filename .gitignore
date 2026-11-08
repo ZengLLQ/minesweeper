@@ -4,3 +4,4 @@ minesweeper_settings.json
 .DS_Store
 Thumbs.db
 \
+.idea/
